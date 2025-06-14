@@ -34,6 +34,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ message: 'Missing required fields' }, { status: 400 })
     }
 
+    if (quota < 1 || quota > 10000) {
+      return NextResponse.json({ message: 'Quota must be between 1 and 10,000' }, { status: 400 })
+    }
+
     // Check if slug already exists
     const [existingSlug] = await db.execute('SELECT id FROM events WHERE slug = ?', [slug])
     if ((existingSlug as any[]).length > 0) {
@@ -47,6 +51,17 @@ export async function POST(request: NextRequest) {
     
     if (ticketDesignFile && ticketDesignFile.size > 0) {
       console.log('📁 Processing file upload:', ticketDesignFile.name, ticketDesignFile.size)
+      
+      // Validate file size (10MB limit)
+      if (ticketDesignFile.size > 10 * 1024 * 1024) {
+        return NextResponse.json({ message: 'File size must be less than 10MB' }, { status: 400 })
+      }
+
+      // Validate file type
+      const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif']
+      if (!allowedTypes.includes(ticketDesignFile.type)) {
+        return NextResponse.json({ message: 'Only PNG, JPG, and GIF files are allowed' }, { status: 400 })
+      }
       
       try {
         const bytes = await ticketDesignFile.arrayBuffer()
@@ -110,7 +125,7 @@ export async function POST(request: NextRequest) {
             type: ticketDesignType
           })
 
-          // After writing file and before saving path to DB, check if file exists and path is valid
+          // Validate path before saving to DB
           if (ticketDesignPath && (!ticketDesignPath.startsWith('/uploads/') || ticketDesignPath.includes('..'))) {
             throw new Error('Invalid ticket design path')
           }
@@ -163,42 +178,60 @@ export async function POST(request: NextRequest) {
 
     const serverUrl = process.env.SERVER_URL || 'http://localhost:3000'
     const tickets = []
+    let successCount = 0
+    let errorCount = 0
 
     for (let i = 0; i < quota; i++) {
-      const token = uuidv4().replace(/-/g, '').substring(0, 12).toUpperCase()
-      const registrationUrl = `${serverUrl}/register?token=${token}`
-      
       try {
-        // Generate QR code
+        const token = uuidv4().replace(/-/g, '').substring(0, 12).toUpperCase()
+        const registrationUrl = `${serverUrl}/register?token=${token}`
+        
+        // Generate QR code with better error handling
         const qrCodeBuffer = await QRCode.toBuffer(registrationUrl, {
-          width: 200,
-          margin: 2,
+          width: 400,
+          margin: 4,
           color: {
             dark: '#000000',
             light: '#FFFFFF'
-          }
+          },
+          errorCorrectionLevel: 'H',
+          type: 'png',
         })
+        
         const qrCodePath = path.join(ticketsDir, `qr_${token}.png`)
-        await writeFile(qrCodePath, qrCodeBuffer)
+        await writeFile(qrCodePath, qrCodeBuffer, { mode: 0o644 })
         
         // Add ticket to batch insert
         tickets.push([eventId, token, `/tickets/qr_${token}.png`, false])
+        successCount++
         
-        if ((i + 1) % 10 === 0 || i === quota - 1) {
+        if ((i + 1) % 50 === 0 || i === quota - 1) {
           console.log(`✅ Generated ${i + 1}/${quota} tickets`)
         }
       } catch (ticketError) {
         console.error(`⚠️ Failed to generate ticket ${i + 1}:`, ticketError)
+        errorCount++
       }
     }
 
-    // Insert all tickets at once
+    // Insert all tickets at once with better error handling
     if (tickets.length > 0) {
-      const placeholders = tickets.map(() => '(?, ?, ?, ?)').join(', ')
-      const values = tickets.flat()
-      await db.execute(`
-        INSERT INTO tickets (event_id, token, qr_code_url, is_verified) VALUES ${placeholders}
-      `, values)
+      try {
+        const placeholders = tickets.map(() => '(?, ?, ?, ?)').join(', ')
+        const values = tickets.flat()
+        await db.execute(`
+          INSERT INTO tickets (event_id, token, qr_code_url, is_verified) VALUES ${placeholders}
+        `, values)
+        console.log(`✅ Inserted ${tickets.length} tickets into database`)
+      } catch (insertError) {
+        console.error('❌ Failed to insert tickets:', insertError)
+        return NextResponse.json({ 
+          message: 'Event created but failed to generate some tickets',
+          eventId: eventId,
+          ticketsGenerated: successCount,
+          ticketErrors: errorCount
+        }, { status: 207 }) // 207 Multi-Status
+      }
     }
 
     console.log('✅ Event creation completed successfully')
@@ -206,7 +239,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ 
       message: 'Event created successfully',
       eventId: eventId,
-      ticketsGenerated: quota,
+      ticketsGenerated: successCount,
+      ticketErrors: errorCount,
       ticketDesign: ticketDesignPath
     })
   } catch (error) {
